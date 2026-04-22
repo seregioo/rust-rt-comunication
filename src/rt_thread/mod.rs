@@ -20,10 +20,7 @@ mod preempt_rt {
                 let ret = sched_setscheduler(tid, SCHED_FIFO, &param);
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();
-                    eprintln!(
-                        "Realtime scheduling unavailable ({err}); running without RT priority."
-                    );
-                    return Ok(());
+                    return Err(format!("Realtime scheduling unavailable: {err}"));
                 }
             }
             Ok(())

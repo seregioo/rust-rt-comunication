@@ -1,6 +1,6 @@
 pub mod comedi_driver {
     pub trait DeviceDriver {
-        fn open(&mut self);
+        fn open(&mut self) -> Result<(), String>;
         fn close(&mut self);
     }
 
@@ -117,6 +117,8 @@ pub mod comedi_driver {
                 self.no_device_detected = true;
                 self.ai_channels.clear();
                 self.ao_channels.clear();
+                self.input_port_names.clear();
+                self.output_port_names.clear();
                 return;
             };
 
@@ -144,10 +146,22 @@ pub mod comedi_driver {
             self.no_device_detected = false;
             self.ai_channels = ai;
             self.ao_channels = ao;
+            self.input_port_names = self
+                .ai_channels
+                .iter()
+                .map(|(_, ch)| format!("a{ch}"))
+                .collect();
+            self.output_port_names = self
+                .ao_channels
+                .iter()
+                .map(|(_, ch)| format!("i{ch}"))
+                .collect();
+            self.active_inputs.resize(self.input_port_names.len(), false);
+            self.active_outputs.resize(self.output_port_names.len(), false);
             unsafe { comedilib::close(dev) };
         }
 
-        fn rebuild_calibration_cache(&mut self) -> Result<(), Error> {
+        fn rebuild_calibration_cache(&mut self) -> Result<(), String> {
             let Some(dev) = self.dev.as_ref() else {
                 if self.no_device_detected {
                     if let Some(value) = self.output_values.get_mut("no device detected") {
@@ -177,13 +191,25 @@ pub mod comedi_driver {
             Ok(())
         }
 
+        pub fn try_open(&mut self) -> Result<(), String> {
+            if self.is_open || self.no_device_detected {
+                return Ok(());
+            }
+
+            <Self as DeviceDriver>::open(self)
+        }
+
         pub fn read(&mut self) -> f64 {
             let Some(dev) = self.dev.as_ref() else {
-                return -0.0;
+                return 0.0;
             };
             let dev = dev.as_ptr();
 
             for (idx, (sd, ch)) in self.ai_channels.iter().enumerate() {
+                if self.active_inputs.get(idx).copied() == Some(false) {
+                    continue;
+                }
+
                 let raw = unsafe { comedilib::read(dev, *sd, *ch) }.unwrap();
                 let Some((range, max)) = self.ai_calibration.get(idx).and_then(|v| *v) else {
                     continue;
@@ -192,7 +218,7 @@ pub mod comedi_driver {
 
                 return phys;
             }
-            return -0.0;
+            0.0
         }
 
         pub fn write(&mut self, value: f64) {
@@ -201,22 +227,27 @@ pub mod comedi_driver {
             };
             let dev = dev.as_ptr();
             for (idx, (sd, ch)) in self.ao_channels.iter().enumerate() {
+                if self.active_outputs.get(idx).copied() == Some(false) {
+                    continue;
+                }
+
                 let Some((range, max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
                     continue;
                 };
                 let raw = unsafe { comedilib::from_phys(value, &range, max) };
-                unsafe { comedilib::write(dev, *sd, *ch, raw) };
+                let _ = unsafe { comedilib::write(dev, *sd, *ch, raw) };
             }
         }
     }
 
     impl DeviceDriver for ComediDaq {
-        fn open(&mut self) {
+        fn open(&mut self) -> Result<(), String> {
             let device_path = Self::normalize_device_path(&self.device_path);
-            let dev = unsafe { comedilib::open(device_path) }.unwrap();
+            let dev = unsafe { comedilib::open(device_path) }?;
             self.dev = std::ptr::NonNull::new(dev);
-            self.rebuild_calibration_cache().unwrap();
+            self.rebuild_calibration_cache()?;
             self.is_open = true;
+            Ok(())
         }
 
         fn close(&mut self) {
@@ -232,8 +263,6 @@ pub mod comedi_driver {
         collections::HashMap,
         ffi::{CStr, CString, c_uint},
     };
-
-    use polars_core::utils::arrow::io::ipc::format::ipc::planus::Error;
 
     use crate::comedi::comedilib::{
         self, LsamplT, comedi_data_read, comedi_data_write, comedi_from_phys, comedi_open,
@@ -370,7 +399,7 @@ mod comedilib {
 
     pub unsafe fn open(path: &str) -> Result<*mut comedi_t, String> {
         let cpath = CString::new(path).map_err(|_| "invalid device path".to_string())?;
-        let dev = comedi_open(cpath.as_ptr());
+        let dev = unsafe { comedi_open(cpath.as_ptr()) };
         if dev.is_null() {
             Err(last_error())
         } else {
@@ -379,11 +408,11 @@ mod comedilib {
     }
 
     pub unsafe fn close(dev: *mut comedi_t) {
-        let _ = comedi_close(dev);
+        let _ = unsafe { comedi_close(dev) };
     }
 
     pub unsafe fn get_n_subdevices(dev: *mut comedi_t) -> Result<u32, String> {
-        let n = comedi_get_n_subdevices(dev);
+        let n = unsafe { comedi_get_n_subdevices(dev) };
         if n < 0 {
             Err(last_error())
         } else {
@@ -392,12 +421,12 @@ mod comedilib {
     }
 
     pub unsafe fn get_subdevice_type(dev: *mut comedi_t, subd: u32) -> Result<i32, String> {
-        let t = comedi_get_subdevice_type(dev, subd as c_uint);
+        let t = unsafe { comedi_get_subdevice_type(dev, subd as c_uint) };
         if t < 0 { Err(last_error()) } else { Ok(t) }
     }
 
     pub unsafe fn get_n_channels(dev: *mut comedi_t, subd: u32) -> Result<u32, String> {
-        let n = comedi_get_n_channels(dev, subd as c_uint);
+        let n = unsafe { comedi_get_n_channels(dev, subd as c_uint) };
         if n < 0 {
             Err(last_error())
         } else {
@@ -410,18 +439,18 @@ mod comedilib {
         subd: u32,
         chan: u32,
     ) -> Result<comedi_range, String> {
-        let ptr = comedi_get_range(dev, subd as c_uint, chan as c_uint, 0);
+        let ptr = unsafe { comedi_get_range(dev, subd as c_uint, chan as c_uint, 0) };
         if ptr.is_null() {
             Err(last_error())
         } else {
-            Ok(*ptr)
+            Ok(unsafe { *ptr })
         }
     }
 
     pub unsafe fn get_maxdata(dev: *mut comedi_t, subd: u32, chan: u32) -> Result<LsamplT, String> {
-        let val = comedi_get_maxdata(dev, subd as c_uint, chan as c_uint);
+        let val = unsafe { comedi_get_maxdata(dev, subd as c_uint, chan as c_uint) };
         if val == 0 {
-            let err = comedi_errno();
+            let err = unsafe { comedi_errno() };
             if err != 0 { Err(last_error()) } else { Ok(val) }
         } else {
             Ok(val)
@@ -429,16 +458,16 @@ mod comedilib {
     }
 
     pub unsafe fn to_phys(data: LsamplT, range: &comedi_range, maxdata: LsamplT) -> f64 {
-        comedi_to_phys(data, range as *const comedi_range, maxdata) as f64
+        unsafe { comedi_to_phys(data, range as *const comedi_range, maxdata) as f64 }
     }
 
     pub unsafe fn from_phys(data: f64, range: &comedi_range, maxdata: LsamplT) -> LsamplT {
-        comedi_from_phys(data, range as *const comedi_range, maxdata)
+        unsafe { comedi_from_phys(data, range as *const comedi_range, maxdata) }
     }
 
     pub unsafe fn read(dev: *mut comedi_t, subd: u32, chan: u32) -> Result<LsamplT, String> {
         let mut data: LsamplT = 0;
-        let res = comedi_data_read(dev, subd as c_uint, chan as c_uint, 0, 0, &mut data);
+        let res = unsafe { comedi_data_read(dev, subd as c_uint, chan as c_uint, 0, 0, &mut data) };
         if res < 0 { Err(last_error()) } else { Ok(data) }
     }
 
@@ -448,8 +477,7 @@ mod comedilib {
         chan: u32,
         data: LsamplT,
     ) -> Result<(), String> {
-        let res = comedi_data_write(dev, subd as c_uint, chan as c_uint, 0, 0, data);
+        let res = unsafe { comedi_data_write(dev, subd as c_uint, chan as c_uint, 0, 0, data) };
         if res < 0 { Err(last_error()) } else { Ok(()) }
     }
 }
-

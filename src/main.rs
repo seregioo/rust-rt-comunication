@@ -2,26 +2,25 @@ mod comedi;
 mod hindmarsh_rose;
 mod rt_thread;
 
-use libc::{
-    CLOCK_MONOTONIC, SCHED_FIFO, SYS_gettid, TIMER_ABSTIME, clock_gettime, clock_nanosleep,
-    sched_param, sched_setscheduler, syscall, timespec,
-};
+use libc::{CLOCK_MONOTONIC, clock_gettime, timespec};
 use polars_core::prelude::*;
 use polars_io::prelude::*;
 use std::{
     collections::HashSet,
     fs::File,
-    sync::mpsc::{Receiver, Sender, TryRecvError},
+    sync::mpsc::Sender,
+    time::Duration,
 };
 
-use crate::comedi::comedi_driver::{ComediDaq, from_phys, open, to_phys, write};
+use crate::comedi::comedi_driver::ComediDaq;
 use crate::hindmarsh_rose::{
     HindmarshRoseModel, HindmarshRoseRungeKutta, ModelDerivativeVariables, ModelTemporalVariables,
 };
+use crate::rt_thread::ActiveRtBackend;
 
 #[derive(Debug, Clone)]
 pub enum LogicState {
-    End,
+    Finished(Result<(), String>),
 }
 
 fn get_time() -> i64 {
@@ -32,33 +31,43 @@ fn get_time() -> i64 {
     unsafe {
         clock_gettime(CLOCK_MONOTONIC, &mut now);
     }
-    return now.tv_nsec;
+
+    now.tv_sec * 1_000_000_000 + now.tv_nsec
 }
 
-fn run_receiver_thread(logic_state_tx: Sender<LogicState>) {
-    let time_init = get_time();
-    // loop {
-    //     match logic_rx.try_recv() {
-    //         Ok(message) => match message {
-    //             LogicMessage::Value(value) => {}
-    //         },
-    //
-    //         Err(TryRecvError::Empty) => break,
-    //         Err(TryRecvError::Disconnected) => break,
-    //     }
-    // }
+fn write_results(
+    filename: &str,
+    times_at_begin: Vec<i64>,
+    times_after_op: Vec<i64>,
+    times_after_send: Vec<i64>,
+    times_after_receive: Vec<i64>,
+) -> Result<(), String> {
+    let columns = vec![
+        Column::new("time_at_begin_ns".into(), times_at_begin),
+        Column::new("time_after_op_ns".into(), times_after_op),
+        Column::new("time_after_send_ns".into(), times_after_send),
+        Column::new("time_after_receive_ns".into(), times_after_receive),
+    ];
+    let mut df = DataFrame::new(columns).map_err(|err| err.to_string())?;
+    let mut file_descriptor = File::create(filename).map_err(|err| err.to_string())?;
+
+    CsvWriter::new(&mut file_descriptor)
+        .include_header(true)
+        .with_separator(b',')
+        .finish(&mut df)
+        .map_err(|err| err.to_string())
+}
+
+fn run_receiver_thread(logic_state_tx: Sender<LogicState>) -> Result<(), String> {
     let time_init = get_time();
 
     let duration_s = 60.0 * 10.0;
     let time_increment = 0.0015;
-    let mut time_counter = 0.0;
-
     let frequency_hz = 10000.0;
-    let goal = frequency_hz * duration_s;
+    let sample_period = Duration::from_secs_f64(1.0 / frequency_hz);
+    let goal = (frequency_hz * duration_s) as usize;
 
-    let filename: String = "rust-test.csv".to_string();
-
-    let downsample_rate = 100;
+    let filename = "rust-test.csv";
 
     let x = -1.3;
     let y = 1.0;
@@ -89,13 +98,16 @@ fn run_receiver_thread(logic_state_tx: Sender<LogicState>) {
     output_ports.insert("i7".to_string());
 
     daq.set_active_ports(&input_ports, &output_ports);
+    if let Err(err) = daq.try_open() {
+        eprintln!("DAQ open failed: {err}. Continuing without COMEDI I/O.");
+    }
 
-    while time_counter < goal {
+    let mut next_activation = ActiveRtBackend::init_sleep(sample_period);
+    for _ in 0..goal {
         let time_at_begin = get_time();
 
         hr_model.calculate_hindmarsh_rose();
         let (x_sent, _, _) = hr_model.get_model_info();
-        time_counter += time_increment;
 
         let time_after_op = get_time();
 
@@ -105,52 +117,67 @@ fn run_receiver_thread(logic_state_tx: Sender<LogicState>) {
 
         let x_read = daq.read();
 
-        if x_sent != x_read {
+        if daq.is_open() && (x_sent - x_read).abs() > f64::EPSILON {
             println!("Incongruence on daq {x_sent} != {x_read}");
         }
 
-        let time_after_recieve = get_time();
+        let time_after_receive = get_time();
 
         times_at_begin.push(time_at_begin);
         times_after_op.push(time_after_op);
         times_after_send.push(time_after_send);
-        times_after_receive.push(time_after_recieve);
+        times_after_receive.push(time_after_receive);
+
+        ActiveRtBackend::sleep(sample_period, &mut next_activation);
     }
-    let mut columns = Vec::new();
+    let time_end = times_after_receive.last().copied();
 
-    let column = Column::new("time_at_begin".into(), times_at_begin);
-    columns.push(column);
-    let df: PolarsResult<DataFrame> = DataFrame::new(columns);
+    write_results(
+        filename,
+        times_at_begin,
+        times_after_op,
+        times_after_send,
+        times_after_receive,
+    )?;
 
-    let mut df = df.unwrap();
-
-    let mut file_descriptor = File::create(filename).unwrap();
-
-    let _ = CsvWriter::new(&mut file_descriptor)
-        .include_header(true)
-        .with_separator(b',')
-        .finish(&mut df);
-
-    if let Some(time_end) = times_after_receive.last() {
+    if let Some(time_end) = time_end {
         println!("Started at {time_init} ended at {time_end}");
     } else {
-        println!("Program failed")
+        return Err("No samples were captured".to_string());
     }
 
-    let _ = logic_state_tx.send(LogicState::End);
+    let _ = logic_state_tx.send(LogicState::Finished(Ok(())));
+    Ok(())
 }
+
 fn main() {
     let (logic_state_tx, logic_state_rx) = std::sync::mpsc::channel::<LogicState>();
 
-    rt_thread::RuntimeThread::spawn(move || {
-        let _ = run_receiver_thread(logic_state_tx);
-    })
-    .unwrap();
-
-    loop {
-        match logic_state_rx.try_recv() {
-            Ok(_) => break,
-            Err(_) => break,
+    let handle = rt_thread::RuntimeThread::spawn(move || {
+        let result = run_receiver_thread(logic_state_tx.clone());
+        if let Err(err) = result {
+            let _ = logic_state_tx.send(LogicState::Finished(Err(err)));
         }
+    })
+    .unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    });
+
+    match logic_state_rx.recv() {
+        Ok(LogicState::Finished(Ok(()))) => {}
+        Ok(LogicState::Finished(Err(err))) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("Worker thread exited unexpectedly: {err}");
+            std::process::exit(1);
+        }
+    }
+
+    if handle.join().is_err() {
+        eprintln!("Worker thread panicked");
+        std::process::exit(1);
     }
 }

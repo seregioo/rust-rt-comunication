@@ -3,6 +3,11 @@ name = "rust-comunication"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+preempt_rt = []
+xenomai = []
+
 [dependencies]
 libc = "0.2"
 polars = "0.50.0"
