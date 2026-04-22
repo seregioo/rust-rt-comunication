@@ -5,12 +5,7 @@ mod rt_thread;
 use libc::{CLOCK_MONOTONIC, clock_gettime, timespec};
 use polars_core::prelude::*;
 use polars_io::prelude::*;
-use std::{
-    collections::HashSet,
-    fs::File,
-    sync::mpsc::Sender,
-    time::Duration,
-};
+use std::{collections::HashSet, fs::File, sync::mpsc::Sender, time::Duration};
 
 use crate::comedi::comedi_driver::ComediDaq;
 use crate::hindmarsh_rose::{
