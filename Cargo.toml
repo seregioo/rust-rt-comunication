@@ -1,0 +1,10 @@
+[package]
+name = "rust-comunication"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2"
+polars = "0.50.0"
+polars-core = "0.50.0"
+polars-io = "0.50.0"
