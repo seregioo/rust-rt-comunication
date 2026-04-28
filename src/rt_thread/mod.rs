@@ -63,8 +63,9 @@ mod preempt_rt {
 
 #[cfg(all(not(feature = "preempt_rt"), not(feature = "xenomai")))]
 mod normal_thread {
-    use libc::timespec;
-    use std::{thread, time::Duration};
+    use libc::{CLOCK_MONOTONIC, TIMER_ABSTIME, clock_gettime, clock_nanosleep, timespec};
+    use std::ptr;
+    use std::time::Duration;
 
     pub struct NormalThread;
 
@@ -73,27 +74,37 @@ mod normal_thread {
             Ok(())
         }
 
-        pub fn init_sleep(_period: Duration) -> timespec {
-            timespec {
+        pub fn init_sleep(period: Duration) -> timespec {
+            let mut now = timespec {
                 tv_sec: 0,
                 tv_nsec: 0,
+            };
+            unsafe {
+                clock_gettime(CLOCK_MONOTONIC, &mut now);
             }
+            add_duration(&mut now, period);
+            now
         }
 
-        pub fn sleep(period: Duration, _next: &mut timespec) {
+        pub fn sleep(period: Duration, next: &mut timespec) {
             if period.is_zero() {
                 return;
             }
-            // For very short periods, use spin-wait for better precision
-            if period.as_nanos() < 500_000 {
-                // Less than 500μs
-                let start = std::time::Instant::now();
-                while start.elapsed() < period {
-                    std::hint::spin_loop();
-                }
-            } else {
-                thread::sleep(period);
+            unsafe {
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next, ptr::null_mut());
             }
+            add_duration(next, period);
+        }
+    }
+
+    fn add_duration(target: &mut timespec, duration: Duration) {
+        let secs = duration.as_secs() as i64;
+        let nanos = duration.subsec_nanos() as i64;
+        target.tv_sec += secs;
+        target.tv_nsec += nanos;
+        if target.tv_nsec >= 1_000_000_000 {
+            target.tv_sec += target.tv_nsec / 1_000_000_000;
+            target.tv_nsec %= 1_000_000_000;
         }
     }
 }
