@@ -32,12 +32,16 @@ fn get_time() -> i64 {
 
 fn write_results(
     filename: &str,
+    x_trans: Vec<f64>,
+    x_recv: Vec<f64>,
     times_at_begin: Vec<i64>,
     times_after_op: Vec<i64>,
     times_after_send: Vec<i64>,
     times_after_receive: Vec<i64>,
 ) -> Result<(), String> {
     let columns = vec![
+        Column::new("x_trans".into(), x_trans),
+        Column::new("x_recv".into(), x_recv),
         Column::new("time_at_begin_ns".into(), times_at_begin),
         Column::new("time_after_op_ns".into(), times_after_op),
         Column::new("time_after_send_ns".into(), times_after_send),
@@ -80,17 +84,20 @@ fn run_receiver_thread(logic_state_tx: Sender<LogicState>) -> Result<(), String>
     let mut times_after_op = Vec::new();
     let mut times_after_send = Vec::new();
     let mut times_after_receive = Vec::new();
+    let mut x_trans = Vec::new();
+    let mut x_recv = Vec::new();
 
     let mut hr_model =
         HindmarshRoseRungeKutta::new(model_derivatives, temporal_variables, time_increment);
 
     let mut daq = ComediDaq::new();
-
+    println!("AO chanels:");
+    println!("AI chanels:");
     let mut input_ports = HashSet::new();
     let mut output_ports = HashSet::new();
 
-    input_ports.insert("a0".to_string());
-    output_ports.insert("i7".to_string());
+    input_ports.insert("a7".to_string());
+    output_ports.insert("i0".to_string());
 
     daq.set_active_ports(&input_ports, &output_ports);
     if let Err(err) = daq.try_open() {
@@ -112,12 +119,18 @@ fn run_receiver_thread(logic_state_tx: Sender<LogicState>) -> Result<(), String>
 
         let x_read = daq.read();
 
-        if daq.is_open() && (x_sent - x_read).abs() > f64::EPSILON {
-            println!("Incongruence on daq {x_sent} != {x_read}");
-        }
+        // if daq.is_open() && (x_sent - x_read).abs() > f64::EPSILON {
+        //    println!("Incongruence on daq {x_sent} != {x_read}");
+        //}
+        // else
+        // {
+        //     println!("Received {x_sent} == {x_read}");
+        // }
 
         let time_after_receive = get_time();
 
+        x_trans.push(x_sent);
+        x_recv.push(x_read);
         times_at_begin.push(time_at_begin);
         times_after_op.push(time_after_op);
         times_after_send.push(time_after_send);
@@ -129,6 +142,8 @@ fn run_receiver_thread(logic_state_tx: Sender<LogicState>) -> Result<(), String>
 
     write_results(
         filename,
+        x_trans,
+        x_recv,
         times_at_begin,
         times_after_op,
         times_after_send,

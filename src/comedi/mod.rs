@@ -9,8 +9,8 @@ pub mod comedi_driver {
         output_port_names: Vec<String>,
 
         device_path: String,
-        ai_channels: Vec<(u32, u32)>,
-        ao_channels: Vec<(u32, u32)>,
+        pub ai_channels: Vec<(u32, u32)>,
+        pub ao_channels: Vec<(u32, u32)>,
 
         input_values: HashMap<String, f64>,
         output_values: HashMap<String, f64>,
@@ -95,6 +95,14 @@ pub mod comedi_driver {
             input_ports: &std::collections::HashSet<String>,
             output_ports: &std::collections::HashSet<String>,
         ) {
+            for x in &self.input_port_names
+            {
+                println!("{x}");
+            }
+            for x in &self.output_port_names
+            {
+                println!("{x}");
+            }
             if self.active_inputs.len() != self.input_port_names.len() {
                 self.active_inputs
                     .resize(self.input_port_names.len(), false);
