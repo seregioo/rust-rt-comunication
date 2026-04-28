@@ -9,6 +9,10 @@ pub mod comedi_driver {
         output_port_names: Vec<String>,
 
         device_path: String,
+        ai_range_index: u32,
+        ao_range_index: u32,
+        ai_aref: u32,
+        ao_aref: u32,
         pub ai_channels: Vec<(u32, u32)>,
         pub ao_channels: Vec<(u32, u32)>,
 
@@ -42,6 +46,10 @@ pub mod comedi_driver {
                 input_port_names: Vec::new(),
                 output_port_names: Vec::new(),
                 device_path: "/dev/comedi0".to_string(),
+                ai_range_index: 0,
+                ao_range_index: 0,
+                ai_aref: 0,
+                ao_aref: 0,
                 ai_channels: Vec::new(),
                 ao_channels: Vec::new(),
                 input_values: HashMap::new(),
@@ -61,6 +69,22 @@ pub mod comedi_driver {
 
             plugin.auto_configure();
             plugin
+        }
+
+        pub fn set_data_config(
+            &mut self,
+            ai_range_index: u32,
+            ao_range_index: u32,
+            ai_aref: u32,
+            ao_aref: u32,
+        ) {
+            self.ai_range_index = ai_range_index;
+            self.ao_range_index = ao_range_index;
+            self.ai_aref = ai_aref;
+            self.ao_aref = ao_aref;
+            if self.is_open {
+                let _ = self.rebuild_calibration_cache();
+            }
         }
 
         pub fn set_config(&mut self, device_path: String, scan_devices: bool, scan_nonce: u64) {
@@ -185,14 +209,16 @@ pub mod comedi_driver {
             self.ao_calibration.clear();
             self.ao_calibration.reserve(self.ao_channels.len());
             for (sd, ch) in &self.ao_channels {
-                let range = unsafe { comedilib::get_range(dev, *sd, *ch) }.unwrap();
+                let range =
+                    unsafe { comedilib::get_range(dev, *sd, *ch, self.ao_range_index) }.unwrap();
                 let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }.unwrap();
                 self.ao_calibration.push(Some((range, max)));
             }
             self.ai_calibration.clear();
             self.ai_calibration.reserve(self.ai_channels.len());
             for (sd, ch) in &self.ai_channels {
-                let range = unsafe { comedilib::get_range(dev, *sd, *ch) }.unwrap();
+                let range =
+                    unsafe { comedilib::get_range(dev, *sd, *ch, self.ai_range_index) }.unwrap();
                 let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }.unwrap();
                 self.ai_calibration.push(Some((range, max)));
             }
@@ -218,7 +244,10 @@ pub mod comedi_driver {
                     continue;
                 }
 
-                let raw = unsafe { comedilib::read(dev, *sd, *ch) }.unwrap();
+                let raw = unsafe {
+                    comedilib::read(dev, *sd, *ch, self.ai_range_index, self.ai_aref)
+                }
+                .unwrap();
                 let Some((range, max)) = self.ai_calibration.get(idx).and_then(|v| *v) else {
                     continue;
                 };
@@ -227,6 +256,17 @@ pub mod comedi_driver {
                 return phys;
             }
             0.0
+        }
+
+        pub fn read_average(&mut self, samples: usize) -> f64 {
+            if samples == 0 {
+                return self.read();
+            }
+            let mut total = 0.0;
+            for _ in 0..samples {
+                total += self.read();
+            }
+            total / samples as f64
         }
 
         pub fn write(&mut self, value: f64) {
@@ -243,7 +283,9 @@ pub mod comedi_driver {
                     continue;
                 };
                 let raw = unsafe { comedilib::from_phys(value, &range, max) };
-                let _ = unsafe { comedilib::write(dev, *sd, *ch, raw) };
+                let _ = unsafe {
+                    comedilib::write(dev, *sd, *ch, self.ao_range_index, self.ao_aref, raw)
+                };
             }
         }
     }
@@ -301,17 +343,44 @@ pub mod comedi_driver {
         }
     }
 
-    pub fn read(dev: *mut comedi_t, subd: u32, chan: u32) -> Result<LsamplT, String> {
+    pub fn read(
+        dev: *mut comedi_t,
+        subd: u32,
+        chan: u32,
+        range: u32,
+        aref: u32,
+    ) -> Result<LsamplT, String> {
         let mut data: LsamplT = 0;
         unsafe {
-            let res = comedi_data_read(dev, subd as c_uint, chan as c_uint, 0, 0, &mut data);
+            let res = comedi_data_read(
+                dev,
+                subd as c_uint,
+                chan as c_uint,
+                range as c_uint,
+                aref as c_uint,
+                &mut data,
+            );
             if res < 0 { Err(last_error()) } else { Ok(data) }
         }
     }
 
-    pub fn write(dev: *mut comedi_t, subd: u32, chan: u32, data: LsamplT) -> Result<(), String> {
+    pub fn write(
+        dev: *mut comedi_t,
+        subd: u32,
+        chan: u32,
+        range: u32,
+        aref: u32,
+        data: LsamplT,
+    ) -> Result<(), String> {
         unsafe {
-            let res = comedi_data_write(dev, subd as c_uint, chan as c_uint, 0, 0, data);
+            let res = comedi_data_write(
+                dev,
+                subd as c_uint,
+                chan as c_uint,
+                range as c_uint,
+                aref as c_uint,
+                data,
+            );
             if res < 0 { Err(last_error()) } else { Ok(()) }
         }
     }
@@ -446,8 +515,16 @@ mod comedilib {
         dev: *mut comedi_t,
         subd: u32,
         chan: u32,
+        range_index: u32,
     ) -> Result<comedi_range, String> {
-        let ptr = unsafe { comedi_get_range(dev, subd as c_uint, chan as c_uint, 0) };
+        let ptr = unsafe {
+            comedi_get_range(
+                dev,
+                subd as c_uint,
+                chan as c_uint,
+                range_index as c_uint,
+            )
+        };
         if ptr.is_null() {
             Err(last_error())
         } else {
@@ -473,9 +550,24 @@ mod comedilib {
         unsafe { comedi_from_phys(data, range as *const comedi_range, maxdata) }
     }
 
-    pub unsafe fn read(dev: *mut comedi_t, subd: u32, chan: u32) -> Result<LsamplT, String> {
+    pub unsafe fn read(
+        dev: *mut comedi_t,
+        subd: u32,
+        chan: u32,
+        range: u32,
+        aref: u32,
+    ) -> Result<LsamplT, String> {
         let mut data: LsamplT = 0;
-        let res = unsafe { comedi_data_read(dev, subd as c_uint, chan as c_uint, 0, 0, &mut data) };
+        let res = unsafe {
+            comedi_data_read(
+                dev,
+                subd as c_uint,
+                chan as c_uint,
+                range as c_uint,
+                aref as c_uint,
+                &mut data,
+            )
+        };
         if res < 0 { Err(last_error()) } else { Ok(data) }
     }
 
@@ -483,9 +575,20 @@ mod comedilib {
         dev: *mut comedi_t,
         subd: u32,
         chan: u32,
+        range: u32,
+        aref: u32,
         data: LsamplT,
     ) -> Result<(), String> {
-        let res = unsafe { comedi_data_write(dev, subd as c_uint, chan as c_uint, 0, 0, data) };
+        let res = unsafe {
+            comedi_data_write(
+                dev,
+                subd as c_uint,
+                chan as c_uint,
+                range as c_uint,
+                aref as c_uint,
+                data,
+            )
+        };
         if res < 0 { Err(last_error()) } else { Ok(()) }
     }
 }
