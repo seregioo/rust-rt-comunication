@@ -209,19 +209,86 @@ pub mod comedi_driver {
             self.ao_calibration.clear();
             self.ao_calibration.reserve(self.ao_channels.len());
             for (sd, ch) in &self.ao_channels {
-                let range =
-                    unsafe { comedilib::get_range(dev, *sd, *ch, self.ao_range_index) }.unwrap();
-                let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }.unwrap();
+                let range = unsafe { comedilib::get_range(dev, *sd, *ch, self.ao_range_index) }?;
+                let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }?;
                 self.ao_calibration.push(Some((range, max)));
             }
             self.ai_calibration.clear();
             self.ai_calibration.reserve(self.ai_channels.len());
             for (sd, ch) in &self.ai_channels {
-                let range =
-                    unsafe { comedilib::get_range(dev, *sd, *ch, self.ai_range_index) }.unwrap();
-                let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }.unwrap();
+                let range = unsafe { comedilib::get_range(dev, *sd, *ch, self.ai_range_index) }?;
+                let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }?;
                 self.ai_calibration.push(Some((range, max)));
             }
+            Ok(())
+        }
+
+        fn prepare_output_channel(&mut self, idx: usize) -> Result<(), String> {
+            let Some(dev) = self.dev.as_ref() else {
+                return Ok(());
+            };
+            let Some((sd, ch)) = self.ao_channels.get(idx).copied() else {
+                return Ok(());
+            };
+            let Some((range, max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
+                return Ok(());
+            };
+
+            let port_name = match self.output_port_names.get(idx) {
+                Some(name) => name,
+                None => return Ok(()),
+            };
+            let value = self.input_values.get(port_name).copied().unwrap_or(0.0);
+            let raw = unsafe { comedilib::from_phys(value, &range, max) };
+            unsafe { comedilib::write(dev.as_ptr(), sd, ch, self.ao_range_index, self.ao_aref, raw) }?;
+            self.output_values.insert(port_name.clone(), value);
+            Ok(())
+        }
+
+        fn prepare_input_channel(&mut self, idx: usize) -> Result<(), String> {
+            let Some(dev) = self.dev.as_ref() else {
+                return Ok(());
+            };
+            let Some((sd, ch)) = self.ai_channels.get(idx).copied() else {
+                return Ok(());
+            };
+            let Some((range, max)) = self.ai_calibration.get(idx).and_then(|v| *v) else {
+                return Ok(());
+            };
+            let port_name = match self.input_port_names.get(idx) {
+                Some(name) => name.clone(),
+                None => return Ok(()),
+            };
+
+            // Discarding the first conversion primes the channel mux after device open.
+            let _ = unsafe { comedilib::read(dev.as_ptr(), sd, ch, self.ai_range_index, self.ai_aref) }?;
+            let raw = unsafe { comedilib::read(dev.as_ptr(), sd, ch, self.ai_range_index, self.ai_aref) }?;
+            let phys = unsafe { comedilib::to_phys(raw, &range, max) };
+            self.output_values.insert(port_name, phys);
+            Ok(())
+        }
+
+        fn prepare_active_channels(&mut self) -> Result<(), String> {
+            let active_output_indexes: Vec<usize> = self
+                .active_outputs
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, active)| active.then_some(idx))
+                .collect();
+            for idx in active_output_indexes {
+                self.prepare_output_channel(idx)?;
+            }
+
+            let active_input_indexes: Vec<usize> = self
+                .active_inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, active)| active.then_some(idx))
+                .collect();
+            for idx in active_input_indexes {
+                self.prepare_input_channel(idx)?;
+            }
+
             Ok(())
         }
 
@@ -296,6 +363,7 @@ pub mod comedi_driver {
             let dev = unsafe { comedilib::open(device_path) }?;
             self.dev = std::ptr::NonNull::new(dev);
             self.rebuild_calibration_cache()?;
+            self.prepare_active_channels()?;
             self.is_open = true;
             Ok(())
         }
