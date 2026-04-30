@@ -299,14 +299,19 @@ pub mod comedi_driver {
                     continue;
                 }
 
-                let raw = unsafe {
+                let raw = match unsafe {
                     comedilib::read(dev, *sd, *ch, self.ai_range_index, self.ai_aref)
-                }
-                .unwrap();
+                } {
+                    Ok(raw) => raw,
+                    Err(_) => continue,
+                };
                 let Some((range, max)) = self.ai_calibration.get(idx).and_then(|v| *v) else {
                     continue;
                 };
                 let phys = unsafe { comedilib::to_phys(raw, &range, max) };
+                if let Some(port_name) = self.input_port_names.get(idx) {
+                    self.output_values.insert(port_name.clone(), phys);
+                }
 
                 return phys;
             }
@@ -338,9 +343,13 @@ pub mod comedi_driver {
                     continue;
                 };
                 let raw = unsafe { comedilib::from_phys(value, &range, max) };
-                let _ = unsafe {
+                if unsafe {
                     comedilib::write(dev, *sd, *ch, self.ao_range_index, self.ao_aref, raw)
-                };
+                }
+                .is_err()
+                {
+                    continue;
+                }
             }
         }
     }
