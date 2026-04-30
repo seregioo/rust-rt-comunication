@@ -1,7 +1,43 @@
 pub mod comedi_driver {
+    pub const AREF_GROUND: u32 = crate::comedi::comedilib::AREF_GROUND;
+    pub const AREF_COMMON: u32 = crate::comedi::comedilib::AREF_COMMON;
+    pub const AREF_DIFF: u32 = crate::comedi::comedilib::AREF_DIFF;
+    pub const AREF_OTHER: u32 = crate::comedi::comedilib::AREF_OTHER;
+
     pub trait DeviceDriver {
         fn open(&mut self) -> Result<(), String>;
         fn close(&mut self);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct PortCalibration {
+        pub slope: f64,
+        pub intercept: f64,
+    }
+
+    impl PortCalibration {
+        pub fn identity() -> Self {
+            Self {
+                slope: 1.0,
+                intercept: 0.0,
+            }
+        }
+
+        pub fn invert_for_output(&self, desired_value: f64) -> f64 {
+            if self.slope.abs() <= f64::EPSILON {
+                desired_value
+            } else {
+                (desired_value - self.intercept) / self.slope
+            }
+        }
+
+        pub fn normalize_input(&self, measured_value: f64) -> f64 {
+            if self.slope.abs() <= f64::EPSILON {
+                measured_value
+            } else {
+                (measured_value - self.intercept) / self.slope
+            }
+        }
     }
 
     pub struct ComediDaq {
@@ -26,6 +62,10 @@ pub mod comedi_driver {
         active_outputs: Vec<bool>,
         ao_port_names: Vec<String>,
         ai_port_names: Vec<String>,
+        ao_port_calibration: HashMap<String, PortCalibration>,
+        ai_port_calibration: HashMap<String, PortCalibration>,
+        ao_port_calibration_cache: Vec<PortCalibration>,
+        ai_port_calibration_cache: Vec<PortCalibration>,
         ao_calibration: Vec<Option<(comedilib::comedi_range, comedilib::LsamplT)>>,
         ai_calibration: Vec<Option<(comedilib::comedi_range, comedilib::LsamplT)>>,
         no_device_detected: bool,
@@ -48,8 +88,8 @@ pub mod comedi_driver {
                 device_path: "/dev/comedi0".to_string(),
                 ai_range_index: 0,
                 ao_range_index: 0,
-                ai_aref: 0,
-                ao_aref: 0,
+                ai_aref: comedilib::AREF_GROUND,
+                ao_aref: comedilib::AREF_GROUND,
                 ai_channels: Vec::new(),
                 ao_channels: Vec::new(),
                 input_values: HashMap::new(),
@@ -61,6 +101,10 @@ pub mod comedi_driver {
                 active_outputs: Vec::new(),
                 ao_port_names: Vec::new(),
                 ai_port_names: Vec::new(),
+                ao_port_calibration: HashMap::new(),
+                ai_port_calibration: HashMap::new(),
+                ao_port_calibration_cache: Vec::new(),
+                ai_port_calibration_cache: Vec::new(),
                 ao_calibration: Vec::new(),
                 ai_calibration: Vec::new(),
                 no_device_detected: false,
@@ -85,6 +129,22 @@ pub mod comedi_driver {
             if self.is_open {
                 let _ = self.rebuild_calibration_cache();
             }
+        }
+
+        pub fn set_output_port_calibration(
+            &mut self,
+            calibration: HashMap<String, PortCalibration>,
+        ) {
+            self.ao_port_calibration = calibration;
+            self.rebuild_port_calibration_cache();
+        }
+
+        pub fn set_input_port_calibration(
+            &mut self,
+            calibration: HashMap<String, PortCalibration>,
+        ) {
+            self.ai_port_calibration = calibration;
+            self.rebuild_port_calibration_cache();
         }
 
         pub fn set_config(&mut self, device_path: String, scan_devices: bool, scan_nonce: u64) {
@@ -119,14 +179,6 @@ pub mod comedi_driver {
             input_ports: &std::collections::HashSet<String>,
             output_ports: &std::collections::HashSet<String>,
         ) {
-            for x in &self.input_port_names
-            {
-                println!("{x}");
-            }
-            for x in &self.output_port_names
-            {
-                println!("{x}");
-            }
             if self.active_inputs.len() != self.input_port_names.len() {
                 self.active_inputs
                     .resize(self.input_port_names.len(), false);
@@ -141,6 +193,7 @@ pub mod comedi_driver {
             for (idx, name) in self.output_port_names.iter().enumerate() {
                 self.active_outputs[idx] = output_ports.contains(name);
             }
+            self.rebuild_port_calibration_cache();
         }
 
         fn auto_configure(&mut self) {
@@ -190,7 +243,31 @@ pub mod comedi_driver {
                 .collect();
             self.active_inputs.resize(self.input_port_names.len(), false);
             self.active_outputs.resize(self.output_port_names.len(), false);
+            self.rebuild_port_calibration_cache();
             unsafe { comedilib::close(dev) };
+        }
+
+        fn rebuild_port_calibration_cache(&mut self) {
+            self.ao_port_calibration_cache = self
+                .output_port_names
+                .iter()
+                .map(|port_name| {
+                    self.ao_port_calibration
+                        .get(port_name)
+                        .copied()
+                        .unwrap_or_else(PortCalibration::identity)
+                })
+                .collect();
+            self.ai_port_calibration_cache = self
+                .input_port_names
+                .iter()
+                .map(|port_name| {
+                    self.ai_port_calibration
+                        .get(port_name)
+                        .copied()
+                        .unwrap_or_else(PortCalibration::identity)
+                })
+                .collect();
         }
 
         fn rebuild_calibration_cache(&mut self) -> Result<(), String> {
@@ -230,6 +307,11 @@ pub mod comedi_driver {
             let Some((_range, _max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
                 return Ok(());
             };
+            let _ = self
+                .ao_port_calibration_cache
+                .get(idx)
+                .copied()
+                .unwrap_or_else(PortCalibration::identity);
             Ok(())
         }
 
@@ -247,12 +329,18 @@ pub mod comedi_driver {
                 Some(name) => name.clone(),
                 None => return Ok(()),
             };
+            let calibration = self
+                .ai_port_calibration_cache
+                .get(idx)
+                .copied()
+                .unwrap_or_else(PortCalibration::identity);
 
             // Discarding the first conversion primes the channel mux after device open.
             let _ = unsafe { comedilib::read(dev.as_ptr(), sd, ch, self.ai_range_index, self.ai_aref) }?;
             let raw = unsafe { comedilib::read(dev.as_ptr(), sd, ch, self.ai_range_index, self.ai_aref) }?;
             let phys = unsafe { comedilib::to_phys(raw, &range, max) };
-            self.output_values.insert(port_name, phys);
+            self.output_values
+                .insert(port_name, calibration.normalize_input(phys));
             Ok(())
         }
 
@@ -309,11 +397,18 @@ pub mod comedi_driver {
                     continue;
                 };
                 let phys = unsafe { comedilib::to_phys(raw, &range, max) };
+                let calibration = self
+                    .ai_port_calibration_cache
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(PortCalibration::identity);
+                let normalized_phys = calibration.normalize_input(phys);
                 if let Some(port_name) = self.input_port_names.get(idx) {
-                    self.output_values.insert(port_name.clone(), phys);
+                    self.output_values
+                        .insert(port_name.clone(), normalized_phys);
                 }
 
-                return phys;
+                return normalized_phys;
             }
             0.0
         }
@@ -342,7 +437,13 @@ pub mod comedi_driver {
                 let Some((range, max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
                     continue;
                 };
-                let raw = unsafe { comedilib::from_phys(value, &range, max) };
+                let calibration = self
+                    .ao_port_calibration_cache
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(PortCalibration::identity);
+                let calibrated_value = calibration.invert_for_output(value);
+                let raw = unsafe { comedilib::from_phys(calibrated_value, &range, max) };
                 if unsafe {
                     comedilib::write(dev, *sd, *ch, self.ao_range_index, self.ao_aref, raw)
                 }
@@ -485,6 +586,11 @@ mod comedilib {
     }
 
     pub type LsamplT = c_uint;
+
+    pub const AREF_GROUND: c_uint = 0;
+    pub const AREF_COMMON: c_uint = 1;
+    pub const AREF_DIFF: c_uint = 2;
+    pub const AREF_OTHER: c_uint = 3;
 
     pub const SUBD_AI: c_int = 1;
     pub const SUBD_AO: c_int = 2;

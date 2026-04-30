@@ -6,15 +6,15 @@ use libc::{CLOCK_MONOTONIC, clock_gettime, timespec};
 use polars_core::prelude::*;
 use polars_io::prelude::*;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
-    fs::File,
+    fs::{self, File},
     sync::mpsc::Sender,
     thread,
     time::Duration,
 };
 
-use crate::comedi::comedi_driver::ComediDaq;
+use crate::comedi::comedi_driver::{ComediDaq, PortCalibration, AREF_GROUND};
 use crate::hindmarsh_rose::{
     HindmarshRoseModel, HindmarshRoseRungeKutta, ModelDerivativeVariables, ModelTemporalVariables,
 };
@@ -28,6 +28,21 @@ fn ns_to_us(ns: i64) -> f64 {
 enum RunMode {
     Trace,
     Calibrate,
+    FitPortCalibration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalibrationPortKind {
+    Ai,
+    Ao,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CalibrationResult {
+    commanded_values: [f64; 9],
+    measured_values: [f64; 9],
+    slope: f64,
+    intercept: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +58,13 @@ struct AppConfig {
     output_csv: String,
     target_cycle_us: f64,
     duration_s: f64,
+    consistency_tolerance: f64,
+    ai_calibration_file: Option<String>,
+    ao_calibration_file: Option<String>,
+    calibration_port_kind: Option<CalibrationPortKind>,
+    calibration_port_name: Option<String>,
+    calibration_input_csv: Option<String>,
+    calibration_output_file: Option<String>,
     calibration_csv: String,
     calibration_reads: usize,
     calibration_settle_us: u64,
@@ -57,11 +79,18 @@ impl Default for AppConfig {
             output_port: "i0".to_string(),
             ai_range_index: 0,
             ao_range_index: 0,
-            ai_aref: 0,
-            ao_aref: 0,
+            ai_aref: AREF_GROUND,
+            ao_aref: AREF_GROUND,
             output_csv: "rust-test.csv".to_string(),
             target_cycle_us: 100.0,
             duration_s: 60.0 * 10.0,
+            consistency_tolerance: 0.05,
+            ai_calibration_file: None,
+            ao_calibration_file: None,
+            calibration_port_kind: None,
+            calibration_port_name: None,
+            calibration_input_csv: None,
+            calibration_output_file: None,
             calibration_csv: "daq-calibration.csv".to_string(),
             calibration_reads: 64,
             calibration_settle_us: 2_000,
@@ -95,7 +124,7 @@ fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
 
 fn print_usage(binary_name: &str) {
     eprintln!(
-        "Usage: {binary_name} [--mode trace|calibrate] [--device-path PATH] [--input-port a7] [--output-port i0] [--ai-range-index 0] [--ao-range-index 0] [--ai-aref 0] [--ao-aref 0] [--output-csv FILE] [--target-cycle-us 100] [--duration-s 600] [--calibration-csv FILE] [--calibration-reads 64] [--calibration-settle-us 2000]"
+        "Usage: {binary_name} [--mode trace|calibrate|fit-port-calibration] [--device-path PATH] [--input-port a7] [--output-port i0] [--ai-range-index 0] [--ao-range-index 0] [--ai-aref 0] [--ao-aref 0] [--output-csv FILE] [--target-cycle-us 100] [--duration-s 600] [--consistency-tolerance 0.05] [--ai-calibration-file FILE] [--ao-calibration-file FILE] [--calibration-port-kind ai|ao] [--calibration-port-name PORT] [--calibration-input-csv FILE] [--calibration-output-file FILE] [--calibration-csv FILE] [--calibration-reads 64] [--calibration-settle-us 2000]"
     );
 }
 
@@ -145,6 +174,27 @@ fn parse_args() -> Result<AppConfig, String> {
             "--duration-s" => args
                 .next()
                 .ok_or_else(|| "Missing value for --duration-s".to_string())?,
+            "--consistency-tolerance" => args
+                .next()
+                .ok_or_else(|| "Missing value for --consistency-tolerance".to_string())?,
+            "--ai-calibration-file" => args
+                .next()
+                .ok_or_else(|| "Missing value for --ai-calibration-file".to_string())?,
+            "--ao-calibration-file" => args
+                .next()
+                .ok_or_else(|| "Missing value for --ao-calibration-file".to_string())?,
+            "--calibration-port-kind" => args
+                .next()
+                .ok_or_else(|| "Missing value for --calibration-port-kind".to_string())?,
+            "--calibration-port-name" => args
+                .next()
+                .ok_or_else(|| "Missing value for --calibration-port-name".to_string())?,
+            "--calibration-input-csv" => args
+                .next()
+                .ok_or_else(|| "Missing value for --calibration-input-csv".to_string())?,
+            "--calibration-output-file" => args
+                .next()
+                .ok_or_else(|| "Missing value for --calibration-output-file".to_string())?,
             "--calibration-csv" => args
                 .next()
                 .ok_or_else(|| "Missing value for --calibration-csv".to_string())?,
@@ -165,7 +215,13 @@ fn parse_args() -> Result<AppConfig, String> {
                 config.mode = match value.as_str() {
                     "trace" => RunMode::Trace,
                     "calibrate" => RunMode::Calibrate,
-                    _ => return Err("Expected --mode to be 'trace' or 'calibrate'".to_string()),
+                    "fit-port-calibration" => RunMode::FitPortCalibration,
+                    _ => {
+                        return Err(
+                            "Expected --mode to be 'trace', 'calibrate', or 'fit-port-calibration'"
+                                .to_string(),
+                        )
+                    }
                 };
             }
             "--device-path" => config.device_path = value,
@@ -178,6 +234,26 @@ fn parse_args() -> Result<AppConfig, String> {
             "--output-csv" => config.output_csv = value,
             "--target-cycle-us" => config.target_cycle_us = parse_f64(&value, "--target-cycle-us")?,
             "--duration-s" => config.duration_s = parse_f64(&value, "--duration-s")?,
+            "--consistency-tolerance" => {
+                config.consistency_tolerance =
+                    parse_f64(&value, "--consistency-tolerance")?
+            }
+            "--ai-calibration-file" => config.ai_calibration_file = Some(value),
+            "--ao-calibration-file" => config.ao_calibration_file = Some(value),
+            "--calibration-port-kind" => {
+                config.calibration_port_kind = Some(match value.as_str() {
+                    "ai" => CalibrationPortKind::Ai,
+                    "ao" => CalibrationPortKind::Ao,
+                    _ => {
+                        return Err(
+                            "Expected --calibration-port-kind to be 'ai' or 'ao'".to_string(),
+                        )
+                    }
+                })
+            }
+            "--calibration-port-name" => config.calibration_port_name = Some(value),
+            "--calibration-input-csv" => config.calibration_input_csv = Some(value),
+            "--calibration-output-file" => config.calibration_output_file = Some(value),
             "--calibration-csv" => config.calibration_csv = value,
             "--calibration-reads" => {
                 config.calibration_reads = parse_usize(&value, "--calibration-reads")?
@@ -195,11 +271,186 @@ fn parse_args() -> Result<AppConfig, String> {
     if config.duration_s <= 0.0 {
         return Err("--duration-s must be greater than zero".to_string());
     }
+    if config.consistency_tolerance < 0.0 {
+        return Err("--consistency-tolerance must be non-negative".to_string());
+    }
     if config.calibration_reads == 0 {
         return Err("--calibration-reads must be greater than zero".to_string());
     }
+    if config.mode == RunMode::FitPortCalibration {
+        if config.calibration_port_kind.is_none() {
+            return Err(
+                "--calibration-port-kind is required in fit-port-calibration mode".to_string(),
+            );
+        }
+        if config.calibration_port_name.is_none() {
+            return Err(
+                "--calibration-port-name is required in fit-port-calibration mode".to_string(),
+            );
+        }
+        if config.calibration_input_csv.is_none() {
+            return Err(
+                "--calibration-input-csv is required in fit-port-calibration mode".to_string(),
+            );
+        }
+        if config.calibration_output_file.is_none() {
+            return Err(
+                "--calibration-output-file is required in fit-port-calibration mode".to_string(),
+            );
+        }
+    }
 
     Ok(config)
+}
+
+fn load_port_calibration_file(
+    path: &str,
+    label: &str,
+) -> Result<HashMap<String, PortCalibration>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read {label} calibration file '{path}': {err}"))?;
+    let mut calibration: HashMap<String, PortCalibration> = HashMap::new();
+
+    for (line_index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line_index == 0 && line.to_ascii_lowercase().contains("port") {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if fields.len() != 3 {
+            return Err(format!(
+                "Invalid {label} calibration line {} in '{path}': expected 'port,slope,intercept'",
+                line_index + 1
+            ));
+        }
+
+        let port_name = fields[0].to_string();
+        let slope = parse_f64(fields[1], "slope")?;
+        let intercept = parse_f64(fields[2], "intercept")?;
+        calibration.insert(port_name, PortCalibration { slope, intercept });
+    }
+
+    Ok(calibration)
+}
+
+fn load_optional_port_calibration_file(
+    path: &str,
+    label: &str,
+) -> Result<HashMap<String, PortCalibration>, String> {
+    match fs::metadata(path) {
+        Ok(_) => load_port_calibration_file(path, label),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(err) => Err(format!("Failed to inspect {label} calibration file '{path}': {err}")),
+    }
+}
+
+fn fit_linear_calibration(reference_values: &[f64], measured_values: &[f64]) -> Result<PortCalibration, String> {
+    if reference_values.len() != measured_values.len() || reference_values.is_empty() {
+        return Err("Calibration fit requires non-empty equal-length reference and measured series".to_string());
+    }
+
+    let sample_count = reference_values.len() as f64;
+    let mean_x = reference_values.iter().sum::<f64>() / sample_count;
+    let mean_y = measured_values.iter().sum::<f64>() / sample_count;
+    let covariance = reference_values
+        .iter()
+        .zip(measured_values.iter())
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>()
+        / sample_count;
+    let variance_x = reference_values
+        .iter()
+        .map(|x| (x - mean_x).powi(2))
+        .sum::<f64>()
+        / sample_count;
+    if variance_x <= f64::EPSILON {
+        return Err("Calibration fit requires varying reference values".to_string());
+    }
+
+    let slope = covariance / variance_x;
+    let intercept = mean_y - slope * mean_x;
+    Ok(PortCalibration { slope, intercept })
+}
+
+fn write_port_calibration_file(
+    path: &str,
+    calibration: &HashMap<String, PortCalibration>,
+) -> Result<(), String> {
+    let mut entries: Vec<(&String, &PortCalibration)> = calibration.iter().collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut content = String::from("port,slope,intercept\n");
+    for (port_name, calibration) in entries {
+        content.push_str(&format!(
+            "{},{:.12},{:.12}\n",
+            port_name, calibration.slope, calibration.intercept
+        ));
+    }
+
+    fs::write(path, content)
+        .map_err(|err| format!("Failed to write calibration file '{path}': {err}"))
+}
+
+fn fit_port_calibration(config: &AppConfig) -> Result<(), String> {
+    let input_csv = config
+        .calibration_input_csv
+        .as_deref()
+        .ok_or_else(|| "Missing calibration input CSV".to_string())?;
+    let output_file = config
+        .calibration_output_file
+        .as_deref()
+        .ok_or_else(|| "Missing calibration output file".to_string())?;
+    let port_name = config
+        .calibration_port_name
+        .as_deref()
+        .ok_or_else(|| "Missing calibration port name".to_string())?;
+    let port_kind = config
+        .calibration_port_kind
+        .ok_or_else(|| "Missing calibration port kind".to_string())?;
+
+    let calibration_trace = fs::read_to_string(input_csv)
+        .map_err(|err| format!("Failed to read calibration input CSV '{input_csv}': {err}"))?;
+    let mut reference_values: Vec<f64> = Vec::new();
+    let mut measured_values: Vec<f64> = Vec::new();
+
+    for (line_index, raw_line) in calibration_trace.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line_index == 0 && line.to_ascii_lowercase().contains("reference") {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if fields.len() != 2 {
+            return Err(format!(
+                "Invalid calibration sample line {} in '{input_csv}': expected 'reference_value,measured_value'",
+                line_index + 1
+            ));
+        }
+        reference_values.push(parse_f64(fields[0], "reference_value")?);
+        measured_values.push(parse_f64(fields[1], "measured_value")?);
+    }
+
+    let fitted = fit_linear_calibration(&reference_values, &measured_values)?;
+    let label = match port_kind {
+        CalibrationPortKind::Ai => "AI",
+        CalibrationPortKind::Ao => "AO",
+    };
+    let mut existing = load_optional_port_calibration_file(output_file, label)?;
+    existing.insert(port_name.to_string(), fitted);
+    write_port_calibration_file(output_file, &existing)?;
+
+    println!(
+        "Stored {} calibration for {} in {}: measured ~= {:.6} * reference + {:.6}",
+        label, port_name, output_file, fitted.slope, fitted.intercept
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +553,18 @@ fn configure_daq(daq: &mut ComediDaq, config: &AppConfig) {
         config.ai_aref,
         config.ao_aref,
     );
+    if let Some(path) = &config.ai_calibration_file {
+        match load_port_calibration_file(path, "AI") {
+            Ok(calibration) => daq.set_input_port_calibration(calibration),
+            Err(err) => eprintln!("{err}"),
+        }
+    }
+    if let Some(path) = &config.ao_calibration_file {
+        match load_port_calibration_file(path, "AO") {
+            Ok(calibration) => daq.set_output_port_calibration(calibration),
+            Err(err) => eprintln!("{err}"),
+        }
+    }
 
     let mut input_ports: HashSet<String> = HashSet::new();
     let mut output_ports: HashSet<String> = HashSet::new();
@@ -310,53 +573,53 @@ fn configure_daq(daq: &mut ComediDaq, config: &AppConfig) {
     daq.set_active_ports(&input_ports, &output_ports);
 }
 
-fn run_calibration(config: &AppConfig) -> Result<(), String> {
+fn execute_calibration(daq: &mut ComediDaq, config: &AppConfig) -> Result<CalibrationResult, String> {
     let calibration_points: [f64; 9] = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0];
     let settle_duration = Duration::from_micros(config.calibration_settle_us);
 
+    let mut measured_values: [f64; 9] = [0.0; 9];
+    for (index, commanded) in calibration_points.iter().copied().enumerate() {
+        daq.write(commanded);
+        thread::sleep(settle_duration);
+        let measured = daq.read_average(config.calibration_reads);
+        measured_values[index] = measured;
+    }
+
+    let fitted = fit_linear_calibration(&calibration_points, &measured_values)?;
+
+    Ok(CalibrationResult {
+        commanded_values: calibration_points,
+        measured_values,
+        slope: fitted.slope,
+        intercept: fitted.intercept,
+    })
+}
+
+fn run_calibration(config: &AppConfig) -> Result<(), String> {
     let mut daq = ComediDaq::new();
     configure_daq(&mut daq, config);
     daq.try_open()?;
 
-    let mut commanded_values: Vec<f64> = Vec::with_capacity(calibration_points.len());
-    let mut measured_values: Vec<f64> = Vec::with_capacity(calibration_points.len());
-    let mut absolute_error: Vec<f64> = Vec::with_capacity(calibration_points.len());
-
-    for commanded in calibration_points {
-        daq.write(commanded);
-        thread::sleep(settle_duration);
-        let measured = daq.read_average(config.calibration_reads);
-        commanded_values.push(commanded);
-        measured_values.push(measured);
-        absolute_error.push((measured - commanded).abs());
-    }
+    let calibration = execute_calibration(&mut daq, config)?;
+    let absolute_error: Vec<f64> = calibration
+        .commanded_values
+        .iter()
+        .zip(calibration.measured_values.iter())
+        .map(|(commanded, measured)| (measured - commanded).abs())
+        .collect();
 
     write_calibration_results(
         &config.calibration_csv,
-        commanded_values.clone(),
-        measured_values.clone(),
+        calibration.commanded_values.to_vec(),
+        calibration.measured_values.to_vec(),
         absolute_error,
     )?;
 
-    let sample_count = commanded_values.len() as f64;
-    let mean_x = commanded_values.iter().sum::<f64>() / sample_count;
-    let mean_y = measured_values.iter().sum::<f64>() / sample_count;
-    let covariance = commanded_values
-        .iter()
-        .zip(&measured_values)
-        .map(|(x, y)| (x - mean_x) * (y - mean_y))
-        .sum::<f64>()
-        / sample_count;
-    let variance_x = commanded_values
-        .iter()
-        .map(|x| (x - mean_x).powi(2))
-        .sum::<f64>()
-        / sample_count;
-    let slope = covariance / variance_x;
-    let intercept = mean_y - slope * mean_x;
-
     println!("Calibration results written to {}", config.calibration_csv);
-    println!("Estimated transfer function: measured ~= {slope:.6} * commanded + {intercept:.6}");
+    println!(
+        "Estimated transfer function: measured ~= {:.6} * commanded + {:.6}",
+        calibration.slope, calibration.intercept
+    );
 
     Ok(())
 }
@@ -386,6 +649,8 @@ fn run_receiver_thread(config: AppConfig, logic_state_tx: Sender<LogicState>) ->
     let mut times_after_receive: Vec<i64> = Vec::with_capacity(goal);
     let mut x_trans: Vec<f64> = Vec::with_capacity(goal);
     let mut x_recv: Vec<f64> = Vec::with_capacity(goal);
+    let mut mismatch_count: usize = 0;
+    let mut max_abs_error: f64 = 0.0;
 
     let mut hr_model =
         HindmarshRoseRungeKutta::new(model_derivatives, temporal_variables, time_increment);
@@ -410,14 +675,15 @@ fn run_receiver_thread(config: AppConfig, logic_state_tx: Sender<LogicState>) ->
         let time_after_send = get_time();
 
         let x_read = daq.read();
-
-        // if daq.is_open() && (x_sent - x_read).abs() > f64::EPSILON {
-        //    println!("Incongruence on daq {x_sent} != {x_read}");
-        //}
-        // else
-        // {
-        //     println!("Received {x_sent} == {x_read}");
-        // }
+        if daq.is_open() {
+            let abs_error = (x_sent - x_read).abs();
+            if abs_error > config.consistency_tolerance {
+                mismatch_count += 1;
+            }
+            if abs_error > max_abs_error {
+                max_abs_error = abs_error;
+            }
+        }
 
         let time_after_receive = get_time();
 
@@ -445,6 +711,17 @@ fn run_receiver_thread(config: AppConfig, logic_state_tx: Sender<LogicState>) ->
 
     if let Some(time_end) = time_end {
         println!("Started at {time_init} ended at {time_end}");
+        if daq.is_open() {
+            let mismatch_rate = mismatch_count as f64 / goal as f64 * 100.0;
+            println!(
+                "DAQ consistency outside tolerance {:.6}: {}/{} samples ({:.6}%), max abs error {:.6}",
+                config.consistency_tolerance,
+                mismatch_count,
+                goal,
+                mismatch_rate,
+                max_abs_error
+            );
+        }
     } else {
         return Err("No samples were captured".to_string());
     }
@@ -461,6 +738,13 @@ fn main() {
 
     if config.mode == RunMode::Calibrate {
         if let Err(err) = run_calibration(&config) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if config.mode == RunMode::FitPortCalibration {
+        if let Err(err) = fit_port_calibration(&config) {
             eprintln!("{err}");
             std::process::exit(1);
         }
