@@ -224,24 +224,12 @@ pub mod comedi_driver {
         }
 
         fn prepare_output_channel(&mut self, idx: usize) -> Result<(), String> {
-            let Some(dev) = self.dev.as_ref() else {
+            let Some((_sd, _ch)) = self.ao_channels.get(idx).copied() else {
                 return Ok(());
             };
-            let Some((sd, ch)) = self.ao_channels.get(idx).copied() else {
+            let Some((_range, _max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
                 return Ok(());
             };
-            let Some((range, max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
-                return Ok(());
-            };
-
-            let port_name = match self.output_port_names.get(idx) {
-                Some(name) => name,
-                None => return Ok(()),
-            };
-            let value = self.input_values.get(port_name).copied().unwrap_or(0.0);
-            let raw = unsafe { comedilib::from_phys(value, &range, max) };
-            unsafe { comedilib::write(dev.as_ptr(), sd, ch, self.ao_range_index, self.ao_aref, raw) }?;
-            self.output_values.insert(port_name.clone(), value);
             Ok(())
         }
 
@@ -362,8 +350,18 @@ pub mod comedi_driver {
             let device_path = Self::normalize_device_path(&self.device_path);
             let dev = unsafe { comedilib::open(device_path) }?;
             self.dev = std::ptr::NonNull::new(dev);
-            self.rebuild_calibration_cache()?;
-            self.prepare_active_channels()?;
+            if let Err(err) = self
+                .rebuild_calibration_cache()
+                .and_then(|_| self.prepare_active_channels())
+            {
+                if let Some(dev) = self.dev.take() {
+                    unsafe { comedilib::close(dev.as_ptr()) };
+                }
+                self.ao_calibration.clear();
+                self.ai_calibration.clear();
+                self.is_open = false;
+                return Err(err);
+            }
             self.is_open = true;
             Ok(())
         }
