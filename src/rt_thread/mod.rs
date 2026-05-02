@@ -4,19 +4,35 @@ compile_error!("`preempt_rt` and `xenomai` features cannot be enabled simultaneo
 #[cfg(feature = "preempt_rt")]
 mod preempt_rt {
     use libc::{
-        CLOCK_MONOTONIC, SCHED_FIFO, SYS_gettid, TIMER_ABSTIME, clock_gettime, clock_nanosleep,
-        sched_param, sched_setscheduler, syscall, timespec,
+        CLOCK_MONOTONIC, EINTR, MCL_CURRENT, MCL_FUTURE, SCHED_FIFO, SYS_gettid, TIMER_ABSTIME,
+        clock_gettime, clock_nanosleep, mlockall, sched_param, sched_setscheduler, syscall,
+        timespec,
     };
     use std::ptr;
     use std::time::Duration;
+
+    const RT_PRIORITY: i32 = 80;
+    const PREFAULT_STACK_BYTES: usize = 1024 * 1024;
+    const PAGE_SIZE_BYTES: usize = 4096;
 
     pub struct PreemptRt;
 
     impl PreemptRt {
         pub fn prepare() -> Result<(), String> {
             unsafe {
+                if mlockall(MCL_CURRENT | MCL_FUTURE) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(format!("Memory locking unavailable: {err}"));
+                }
+            }
+
+            prefault_stack();
+
+            unsafe {
                 let tid = syscall(SYS_gettid) as i32;
-                let param = sched_param { sched_priority: 99 };
+                let param = sched_param {
+                    sched_priority: RT_PRIORITY,
+                };
                 let ret = sched_setscheduler(tid, SCHED_FIFO, &param);
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();
@@ -42,11 +58,27 @@ mod preempt_rt {
             if period.is_zero() {
                 return;
             }
-            unsafe {
-                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next, ptr::null_mut());
+            loop {
+                let ret = unsafe {
+                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next, ptr::null_mut())
+                };
+                if ret == 0 {
+                    break;
+                }
+                if ret != EINTR {
+                    break;
+                }
             }
             add_duration(next, period);
         }
+    }
+
+    fn prefault_stack() {
+        let mut buffer = [0_u8; PREFAULT_STACK_BYTES];
+        for offset in (0..PREFAULT_STACK_BYTES).step_by(PAGE_SIZE_BYTES) {
+            buffer[offset] = 0;
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 
     fn add_duration(target: &mut timespec, duration: Duration) {
@@ -146,19 +178,25 @@ use std::{sync::mpsc, thread};
 pub(crate) struct RuntimeThread;
 
 impl RuntimeThread {
+    const STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
     pub(crate) fn spawn<F>(f: F) -> Result<thread::JoinHandle<()>, String>
     where
         F: FnOnce() + Send + 'static,
     {
         let (status_tx, status_rx) = mpsc::sync_channel(1);
-        let handle = thread::spawn(move || {
-            let status = ActiveRtBackend::prepare();
-            let _ = status_tx.send(status.clone());
-            if status.is_err() {
-                return;
-            }
-            f();
-        });
+        let handle = thread::Builder::new()
+            .name("rt-worker".to_string())
+            .stack_size(Self::STACK_SIZE_BYTES)
+            .spawn(move || {
+                let status = ActiveRtBackend::prepare();
+                let _ = status_tx.send(status.clone());
+                if status.is_err() {
+                    return;
+                }
+                f();
+            })
+            .map_err(|err| format!("Failed to spawn realtime thread: {err}"))?;
 
         match status_rx.recv() {
             Ok(Ok(())) => Ok(handle),
