@@ -40,6 +40,12 @@ pub mod comedi_driver {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct ChannelCalibration {
+        to_converter: Option<comedilib::comedi_polynomial_t>,
+        from_converter: Option<comedilib::comedi_polynomial_t>,
+    }
+
     pub struct ComediDaq {
         input_port_names: Vec<String>,
         output_port_names: Vec<String>,
@@ -66,10 +72,11 @@ pub mod comedi_driver {
         ai_port_calibration: HashMap<String, PortCalibration>,
         ao_port_calibration_cache: Vec<PortCalibration>,
         ai_port_calibration_cache: Vec<PortCalibration>,
-        ao_calibration: Vec<Option<(comedilib::comedi_range, comedilib::LsamplT)>>,
-        ai_calibration: Vec<Option<(comedilib::comedi_range, comedilib::LsamplT)>>,
+        ao_calibration: Vec<Option<ChannelCalibration>>,
+        ai_calibration: Vec<Option<ChannelCalibration>>,
         no_device_detected: bool,
         dev: Option<std::ptr::NonNull<comedilib::comedi_t>>,
+        calibration: Option<std::ptr::NonNull<comedilib::comedi_calibration_t>>,
     }
 
     impl ComediDaq {
@@ -109,6 +116,7 @@ pub mod comedi_driver {
                 ai_calibration: Vec::new(),
                 no_device_detected: false,
                 dev: None,
+                calibration: None,
             };
 
             plugin.auto_configure();
@@ -271,7 +279,7 @@ pub mod comedi_driver {
         }
 
         fn rebuild_calibration_cache(&mut self) -> Result<(), String> {
-            let Some(dev) = self.dev.as_ref() else {
+            let Some(_) = self.dev.as_ref() else {
                 if self.no_device_detected {
                     if let Some(value) = self.output_values.get_mut("no device detected") {
                         *value = 1.0;
@@ -282,20 +290,47 @@ pub mod comedi_driver {
                 }
                 return Ok(());
             };
-            let dev = dev.as_ptr();
+            let Some(calibration) = self.calibration.as_ref() else {
+                return Err("comedi calibration not loaded".to_string());
+            };
+            let calibration = calibration.as_ptr();
+
+            // This resolves softcal converters for every discovered channel up front.
+            // If one unused channel has no converter, the whole device open fails.
+            // The C driver defers converter lookup until a specific port is opened.
             self.ao_calibration.clear();
             self.ao_calibration.reserve(self.ao_channels.len());
             for (sd, ch) in &self.ao_channels {
-                let range = unsafe { comedilib::get_range(dev, *sd, *ch, self.ao_range_index) }?;
-                let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }?;
-                self.ao_calibration.push(Some((range, max)));
+                let from_converter = unsafe {
+                    comedilib::get_softcal_converter(
+                        *sd,
+                        *ch,
+                        self.ao_range_index,
+                        comedilib::FROM_PHYSICAL,
+                        calibration,
+                    )
+                }?;
+                self.ao_calibration.push(Some(ChannelCalibration {
+                    to_converter: None,
+                    from_converter: Some(from_converter),
+                }));
             }
             self.ai_calibration.clear();
             self.ai_calibration.reserve(self.ai_channels.len());
             for (sd, ch) in &self.ai_channels {
-                let range = unsafe { comedilib::get_range(dev, *sd, *ch, self.ai_range_index) }?;
-                let max = unsafe { comedilib::get_maxdata(dev, *sd, *ch) }?;
-                self.ai_calibration.push(Some((range, max)));
+                let to_converter = unsafe {
+                    comedilib::get_softcal_converter(
+                        *sd,
+                        *ch,
+                        self.ai_range_index,
+                        comedilib::TO_PHYSICAL,
+                        calibration,
+                    )
+                }?;
+                self.ai_calibration.push(Some(ChannelCalibration {
+                    to_converter: Some(to_converter),
+                    from_converter: None,
+                }));
             }
             Ok(())
         }
@@ -304,7 +339,7 @@ pub mod comedi_driver {
             let Some((_sd, _ch)) = self.ao_channels.get(idx).copied() else {
                 return Ok(());
             };
-            let Some((_range, _max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
+            let Some(_calibration) = self.ao_calibration.get(idx).and_then(|v| *v) else {
                 return Ok(());
             };
             let _ = self
@@ -322,7 +357,10 @@ pub mod comedi_driver {
             let Some((sd, ch)) = self.ai_channels.get(idx).copied() else {
                 return Ok(());
             };
-            let Some((range, max)) = self.ai_calibration.get(idx).and_then(|v| *v) else {
+            let Some(calibration_data) = self.ai_calibration.get(idx).and_then(|v| *v) else {
+                return Ok(());
+            };
+            let Some(to_converter) = calibration_data.to_converter else {
                 return Ok(());
             };
             let port_name = match self.input_port_names.get(idx) {
@@ -338,7 +376,7 @@ pub mod comedi_driver {
             // Discarding the first conversion primes the channel mux after device open.
             let _ = unsafe { comedilib::read(dev.as_ptr(), sd, ch, self.ai_range_index, self.ai_aref) }?;
             let raw = unsafe { comedilib::read(dev.as_ptr(), sd, ch, self.ai_range_index, self.ai_aref) }?;
-            let phys = unsafe { comedilib::to_phys(raw, &range, max) };
+            let phys = unsafe { comedilib::to_physical(raw, &to_converter) };
             self.output_values
                 .insert(port_name, calibration.normalize_input(phys));
             Ok(())
@@ -393,10 +431,13 @@ pub mod comedi_driver {
                     Ok(raw) => raw,
                     Err(_) => continue,
                 };
-                let Some((range, max)) = self.ai_calibration.get(idx).and_then(|v| *v) else {
+                let Some(calibration_data) = self.ai_calibration.get(idx).and_then(|v| *v) else {
                     continue;
                 };
-                let phys = unsafe { comedilib::to_phys(raw, &range, max) };
+                let Some(to_converter) = calibration_data.to_converter else {
+                    continue;
+                };
+                let phys = unsafe { comedilib::to_physical(raw, &to_converter) };
                 let calibration = self
                     .ai_port_calibration_cache
                     .get(idx)
@@ -434,7 +475,10 @@ pub mod comedi_driver {
                     continue;
                 }
 
-                let Some((range, max)) = self.ao_calibration.get(idx).and_then(|v| *v) else {
+                let Some(calibration_data) = self.ao_calibration.get(idx).and_then(|v| *v) else {
+                    continue;
+                };
+                let Some(from_converter) = calibration_data.from_converter else {
                     continue;
                 };
                 let calibration = self
@@ -443,7 +487,7 @@ pub mod comedi_driver {
                     .copied()
                     .unwrap_or_else(PortCalibration::identity);
                 let calibrated_value = calibration.invert_for_output(value);
-                let raw = unsafe { comedilib::from_phys(calibrated_value, &range, max) };
+                let raw = unsafe { comedilib::from_physical(calibrated_value, &from_converter) };
                 if unsafe {
                     comedilib::write(dev, *sd, *ch, self.ao_range_index, self.ao_aref, raw)
                 }
@@ -459,13 +503,19 @@ pub mod comedi_driver {
         fn open(&mut self) -> Result<(), String> {
             let device_path = Self::normalize_device_path(&self.device_path);
             let dev = unsafe { comedilib::open(device_path) }?;
+            let calibration_path = unsafe { comedilib::get_default_calibration_path(dev) }?;
+            let calibration = unsafe { comedilib::parse_calibration_file(&calibration_path) }?;
             self.dev = std::ptr::NonNull::new(dev);
+            self.calibration = std::ptr::NonNull::new(calibration);
             if let Err(err) = self
                 .rebuild_calibration_cache()
                 .and_then(|_| self.prepare_active_channels())
             {
                 if let Some(dev) = self.dev.take() {
                     unsafe { comedilib::close(dev.as_ptr()) };
+                }
+                if let Some(calibration) = self.calibration.take() {
+                    unsafe { comedilib::cleanup_calibration(calibration.as_ptr()) };
                 }
                 self.ao_calibration.clear();
                 self.ai_calibration.clear();
@@ -480,6 +530,9 @@ pub mod comedi_driver {
             if let Some(dev) = self.dev.take() {
                 unsafe { comedilib::close(dev.as_ptr()) };
             }
+            if let Some(calibration) = self.calibration.take() {
+                unsafe { comedilib::cleanup_calibration(calibration.as_ptr()) };
+            }
             self.ao_calibration.clear();
             self.ai_calibration.clear();
             self.is_open = false;
@@ -491,8 +544,7 @@ pub mod comedi_driver {
     };
 
     use crate::comedi::comedilib::{
-        self, LsamplT, comedi_data_read, comedi_data_write, comedi_from_phys, comedi_open,
-        comedi_range, comedi_t, comedi_to_phys,
+        self, LsamplT, comedi_data_read, comedi_data_write, comedi_open, comedi_t,
     };
 
     fn last_error() -> String {
@@ -560,13 +612,6 @@ pub mod comedi_driver {
             if res < 0 { Err(last_error()) } else { Ok(()) }
         }
     }
-    pub fn from_phys(data: f64, range: &comedi_range, maxdata: LsamplT) -> LsamplT {
-        unsafe { comedi_from_phys(data, range as *const comedi_range, maxdata) }
-    }
-
-    pub fn to_phys(data: LsamplT, range: &comedi_range, maxdata: LsamplT) -> f64 {
-        unsafe { comedi_to_phys(data, range as *const comedi_range, maxdata) as f64 }
-    }
 }
 mod comedilib {
     use libc::{c_char, c_double, c_int, c_uint};
@@ -585,6 +630,19 @@ mod comedilib {
         pub unit: c_uint,
     }
 
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct comedi_polynomial_t {
+        pub coefficients: [c_double; 4],
+        pub expansion_origin: c_double,
+        pub order: c_uint,
+    }
+
+    #[repr(C)]
+    pub struct comedi_calibration_t {
+        _private: [u8; 0],
+    }
+
     pub type LsamplT = c_uint;
 
     pub const AREF_GROUND: c_uint = 0;
@@ -594,6 +652,8 @@ mod comedilib {
 
     pub const SUBD_AI: c_int = 1;
     pub const SUBD_AO: c_int = 2;
+    pub const TO_PHYSICAL: c_int = 0;
+    pub const FROM_PHYSICAL: c_int = 1;
 
     #[link(name = "comedi")]
     unsafe extern "C" {
@@ -623,6 +683,25 @@ mod comedilib {
             data: c_double,
             rng: *const comedi_range,
             maxdata: LsamplT,
+        ) -> LsamplT;
+        pub fn comedi_get_default_calibration_path(dev: *mut comedi_t) -> *mut c_char;
+        pub fn comedi_parse_calibration_file(path: *const c_char) -> *mut comedi_calibration_t;
+        pub fn comedi_cleanup_calibration(calibration: *mut comedi_calibration_t);
+        pub fn comedi_get_softcal_converter(
+            subdevice: c_uint,
+            channel: c_uint,
+            range: c_uint,
+            direction: c_int,
+            calibration: *const comedi_calibration_t,
+            polynomial: *mut comedi_polynomial_t,
+        ) -> c_int;
+        pub fn comedi_to_physical(
+            data: LsamplT,
+            polynomial: *const comedi_polynomial_t,
+        ) -> c_double;
+        pub fn comedi_from_physical(
+            data: c_double,
+            polynomial: *const comedi_polynomial_t,
         ) -> LsamplT;
 
         pub fn comedi_data_read(
@@ -667,6 +746,29 @@ mod comedilib {
 
     pub unsafe fn close(dev: *mut comedi_t) {
         let _ = unsafe { comedi_close(dev) };
+    }
+
+    pub unsafe fn get_default_calibration_path(dev: *mut comedi_t) -> Result<String, String> {
+        let path = unsafe { comedi_get_default_calibration_path(dev) };
+        if path.is_null() {
+            Err(last_error())
+        } else {
+            Ok(unsafe { CStr::from_ptr(path) }.to_string_lossy().to_string())
+        }
+    }
+
+    pub unsafe fn parse_calibration_file(path: &str) -> Result<*mut comedi_calibration_t, String> {
+        let cpath = CString::new(path).map_err(|_| "invalid calibration path".to_string())?;
+        let calibration = unsafe { comedi_parse_calibration_file(cpath.as_ptr()) };
+        if calibration.is_null() {
+            Err(last_error())
+        } else {
+            Ok(calibration)
+        }
+    }
+
+    pub unsafe fn cleanup_calibration(calibration: *mut comedi_calibration_t) {
+        unsafe { comedi_cleanup_calibration(calibration) };
     }
 
     pub unsafe fn get_n_subdevices(dev: *mut comedi_t) -> Result<u32, String> {
@@ -729,6 +831,43 @@ mod comedilib {
 
     pub unsafe fn from_phys(data: f64, range: &comedi_range, maxdata: LsamplT) -> LsamplT {
         unsafe { comedi_from_phys(data, range as *const comedi_range, maxdata) }
+    }
+
+    pub unsafe fn get_softcal_converter(
+        subd: u32,
+        chan: u32,
+        range: u32,
+        direction: c_int,
+        calibration: *const comedi_calibration_t,
+    ) -> Result<comedi_polynomial_t, String> {
+        let mut polynomial = comedi_polynomial_t {
+            coefficients: [0.0; 4],
+            expansion_origin: 0.0,
+            order: 0,
+        };
+        let res = unsafe {
+            comedi_get_softcal_converter(
+                subd as c_uint,
+                chan as c_uint,
+                range as c_uint,
+                direction,
+                calibration,
+                &mut polynomial,
+            )
+        };
+        if res < 0 {
+            Err(last_error())
+        } else {
+            Ok(polynomial)
+        }
+    }
+
+    pub unsafe fn to_physical(data: LsamplT, polynomial: &comedi_polynomial_t) -> f64 {
+        unsafe { comedi_to_physical(data, polynomial as *const comedi_polynomial_t) }
+    }
+
+    pub unsafe fn from_physical(data: f64, polynomial: &comedi_polynomial_t) -> LsamplT {
+        unsafe { comedi_from_physical(data, polynomial as *const comedi_polynomial_t) }
     }
 
     pub unsafe fn read(
